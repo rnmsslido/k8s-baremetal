@@ -1,0 +1,128 @@
+---
+- name: K8S - Prerequisites
+  hosts: all
+  gather_facts: False
+  vars:
+    k8s_version: "1.27.4-00"
+    k8s_packages:
+      - "kubelet={{ k8s_version }}"
+      - "kubeadm={{ k8s_version }}"
+      - "kubectl={{ k8s_version }}"
+      - cri-o  
+  tasks:
+    - name: Copy gpg key
+      copy:
+        src: kubernetes-archive-keyring.gpg
+        dest: /etc/apt/trusted.gpg.d/kubernetes-archive-keyring.gpg
+    - name: Create k8s repo file
+      lineinfile:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        line: "deb [signed-by=/etc/apt/trusted.gpg.d/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+    - name: Install packages
+      apt:
+        name: "{{ k8s_packages }}"
+        state: present
+        update_cache: true
+        update_cache_retries: 5
+    - name: Start/Enable services
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - crio
+        - kubelet
+    - name: Create sysctl configs
+      sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: no
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.ipv4.ip_forward
+        - net.bridge.bridge-nf-call-ip6tables
+    - name: Disable swap, enable kernel modules and reload sysctl
+      shell: |
+              swapoff -a
+              sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+              modprobe overlay && modprobe br_netfilter 
+              echo overlay > /etc/modules-load.d/k8s.conf
+              echo br_netfilter >> /etc/modules-load.d/k8s.conf
+              sysctl --system
+
+- name: K8S - Config masters
+  hosts: masters
+  gather_facts: False
+  tasks:
+    - name: Initialize k8s cluster
+      #shell: kubeadm init --kubernetes-version "{{ ver }}" --control-plane-endpoint "{{ lbr }}" --pod-network-cidr "{{ net }}" --upload-certs && touch /root/cluster_initialized
+      shell: kubeadm init --kubernetes-version "{{ k8s_version }}" --pod-network-cidr "{{ net }}" && touch /root/cluster_initialized
+      args:
+        creates: /root/cluster_initialized
+      #failed_when: False
+      vars:
+        #lbr: "loadbalancer.local"
+        net: "192.168.0.0/16"
+      register: output
+    - name: Print output
+      debug:
+        var: output
+    - name: Create .kube folder
+      file:
+        path: /root/.kube
+        state: directory
+        mode: 0755
+    - name: Copy admin config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+    - name: Copy the calico network file
+      copy:
+        src: calico.yaml
+        dest: /root/.kube/calico.yaml
+    - name: Install pod network
+      shell: kubectl apply -f /root/.kube/calico.yaml && touch /root/cluster_network_installed
+      args:
+        creates: /root/cluster_network_installed
+#    - name: Get the token to authorize worker nodes
+#      shell: kubeadm token create --print-join-command
+#      register: k8sjoin
+#    - name: Record the join command
+#      set_fact:
+#        k8sjoincmd: "{{ k8sjoin.stdout }}"
+
+- name: K8S - Config workers
+  hosts: workers
+  gather_facts: False
+  tasks:
+    - name: Get the token to authorize worker nodes
+      shell: kubeadm token create --print-join-command
+      register: k8sjoin
+      run_once: True
+      delegate_to: "{{ groups['masters'][0] }}"
+    - name: Join the cluster
+      command: "{{ k8sjoin.stdout }}"
+
+- name: K8S - General configs
+  hosts: all
+  gather_facts: False
+  tasks:
+    - name: Copy the cgroups fix for kubelet
+      copy:
+        src: 11-cgroups.conf
+        dest: /usr/lib/systemd/system/kubelet.service.d/11-cgroups.conf
+        owner: root
+        group: root
+      tags:
+        - cgroup
+    - name: Restart kubelet
+      systemd:
+        state: restarted
+        daemon_reload: yes
+        name: kubelet
+      tags:
+        - cgroup
+...
+
